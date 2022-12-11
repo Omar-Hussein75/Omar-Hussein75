@@ -1,4 +1,4 @@
-- 👋 Hi, I’m Omar Hussein Mohamed Biomedical and Software engineer . I consider myself as a organized and dependable candidate successful at managing multiple priorities with a positive attitude. Willingness to take on added responsibilities to meet team goals.
+- 👋 Hi, I’m Omar Hussein Mohamed (Biomedical and Software engineer) . I consider myself as a organized and dependable candidate successful at managing multiple priorities with a positive attitude. Willingness to take on added responsibilities to meet team goals.
  and these are my implemented projects
 
 <!---
