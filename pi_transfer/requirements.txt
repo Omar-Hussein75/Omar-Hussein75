@@ -1,2 +1,0 @@
-paramiko>=3.4
-keyring>=24   # optional: read the SFTP password from Windows Credential Manager
