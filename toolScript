@@ -1,0 +1,306 @@
+from pathlib import Path
+from datetime import datetime
+import paramiko
+import shutil
+import smtplib
+import ssl
+import time
+import traceback
+import os
+
+from email.message import EmailMessage
+
+
+# ==========================================
+# General Configuration
+# ==========================================
+
+directory = Path(r"C:\PI_MISMATCH_TOOL")
+out_directory = Path(r"E:\SharePoint_PI_Mismatch_Tool\Out")
+
+CHECK_INTERVAL_SECONDS = 5
+EMAIL_COOLDOWN_SECONDS = 15 * 60  # Prevent repeated emails for 15 minutes
+
+out_directory.mkdir(parents=True, exist_ok=True)
+
+
+# ==========================================
+# SFTP Configuration
+# ==========================================
+
+sftp_host = "10.179.9.211"
+sftp_port = 22
+sftp_username = "raidprd"
+
+# Recommended: Store the password in a Windows environment variable.
+sftp_password = "raidprd123"
+
+remote_directory = "/project/PI_MISMATCH_TOOL/requests"
+
+
+# ==========================================
+# SMTP Configuration
+# ==========================================
+
+smtp_host = "10.230.30.32"
+smtp_port = 25
+
+smtp_sender = "PI_TEAM@vodafone.com"
+smtp_recipients = [
+    "omar.husseinmohamed@vodafone.com.eg"
+]
+
+# Set this to True only if the SMTP server requires authentication.
+smtp_requires_authentication = False
+
+# Set this to True if the SMTP server requires STARTTLS.
+smtp_use_starttls = False
+
+smtp_username = os.getenv("PI_SMTP_USERNAME", "")
+smtp_password = os.getenv("PI_SMTP_PASSWORD", "")
+
+
+# ==========================================
+# Email Function
+# ==========================================
+
+def send_error_email(subject, error_message):
+    """
+    Sends an error notification through the configured SMTP server.
+
+    Email failures are caught inside this function so they do not stop
+    the main monitoring loop.
+    """
+
+    try:
+        message = EmailMessage()
+        message["From"] = smtp_sender
+        message["To"] = ", ".join(smtp_recipients)
+        message["Subject"] = subject
+
+        message.set_content(
+            f"""
+PI Mismatch Tool encountered an error.
+
+Date and time:
+{datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+
+Machine:
+{os.environ.get("COMPUTERNAME", "Unknown")}
+
+Monitored directory:
+{directory}
+
+Error details:
+{error_message}
+
+The tool will continue running and retry automatically after
+{CHECK_INTERVAL_SECONDS} seconds.
+"""
+        )
+
+        with smtplib.SMTP(
+            host=smtp_host,
+            port=smtp_port,
+            timeout=30
+        ) as smtp_server:
+
+            # Useful while testing SMTP communication.
+            # Change to 1 to display SMTP communication details.
+            smtp_server.set_debuglevel(0)
+
+            smtp_server.ehlo()
+
+            if smtp_use_starttls:
+                tls_context = ssl.create_default_context()
+                smtp_server.starttls(context=tls_context)
+                smtp_server.ehlo()
+
+            if smtp_requires_authentication:
+                smtp_server.login(
+                    smtp_username,
+                    smtp_password
+                )
+
+            smtp_server.send_message(message)
+
+        print(
+            f"[{datetime.now():%Y-%m-%d %H:%M:%S}] "
+            "Error notification email sent successfully."
+        )
+
+        return True
+
+    except Exception as email_error:
+        print(
+            f"[{datetime.now():%Y-%m-%d %H:%M:%S}] "
+            f"Failed to send error email: {email_error}"
+        )
+
+        # Do not raise the email error because the main script
+        # must continue running.
+        return False
+
+
+# ==========================================
+# SFTP Upload Function
+# ==========================================
+
+def upload_file(latest_file):
+    """
+    Uploads one file through SFTP and moves it to the output directory
+    only after the upload succeeds.
+    """
+
+    transport = None
+    sftp = None
+
+    try:
+        local_path = str(latest_file)
+        remote_path = f"{remote_directory}/{latest_file.name}"
+
+        print(
+            f"[{datetime.now():%Y-%m-%d %H:%M:%S}] "
+            f"Uploading {latest_file.name}..."
+        )
+
+        transport = paramiko.Transport(
+            (sftp_host, sftp_port)
+        )
+
+        transport.connect(
+            username=sftp_username,
+            password=sftp_password
+        )
+
+        sftp = paramiko.SFTPClient.from_transport(transport)
+
+        sftp.put(
+            localpath=local_path,
+            remotepath=remote_path,
+            confirm=True
+        )
+
+        # Verify that the remote file exists and has the expected size.
+        remote_file_size = sftp.stat(remote_path).st_size
+        local_file_size = latest_file.stat().st_size
+
+        if remote_file_size != local_file_size:
+            raise RuntimeError(
+                "SFTP upload verification failed. "
+                f"Local size: {local_file_size} bytes, "
+                f"remote size: {remote_file_size} bytes."
+            )
+
+        destination = out_directory / latest_file.name
+
+        # Prevent shutil.move from failing if a file with the same
+        # name already exists in the output directory.
+        if destination.exists():
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            destination = (
+                out_directory
+                / f"{latest_file.stem}_{timestamp}{latest_file.suffix}"
+            )
+
+        shutil.move(
+            str(latest_file),
+            str(destination)
+        )
+
+        print(
+            f"[{datetime.now():%Y-%m-%d %H:%M:%S}] "
+            f"{latest_file.name} uploaded and moved successfully."
+        )
+
+    finally:
+        if sftp is not None:
+            try:
+                sftp.close()
+            except Exception as close_error:
+                print(f"Error while closing SFTP client: {close_error}")
+
+        if transport is not None:
+            try:
+                transport.close()
+            except Exception as close_error:
+                print(f"Error while closing SFTP transport: {close_error}")
+
+
+# ==========================================
+# Main Monitoring Loop
+# ==========================================
+
+print("==========================================")
+print(" PI Mismatch Tool Started")
+print(" Monitoring for new JSON files...")
+print(f" Source: {directory}")
+print(f" Archive: {out_directory}")
+print("==========================================")
+
+last_email_time = 0
+last_error_text = None
+
+while True:
+    try:
+        if not directory.exists():
+            raise FileNotFoundError(
+                f"The monitored directory does not exist: {directory}"
+            )
+
+        json_files = list(directory.glob("*.json"))
+
+        if json_files:
+            latest_file = max(
+                json_files,
+                key=lambda file: file.stat().st_mtime
+            )
+
+            # Confirm that the file can be opened before uploading it.
+            with latest_file.open("r", encoding="utf-8") as file:
+                file.read(1)
+
+            upload_file(latest_file)
+
+            # Reset error tracking after a successful upload.
+            last_error_text = None
+
+    except KeyboardInterrupt:
+        print(
+            f"\n[{datetime.now():%Y-%m-%d %H:%M:%S}] "
+            "PI Mismatch Tool stopped manually."
+        )
+        break
+
+    except Exception as error:
+        current_time = time.time()
+        error_traceback = traceback.format_exc()
+
+        print(
+            f"[{datetime.now():%Y-%m-%d %H:%M:%S}] "
+            f"ERROR: {error}"
+        )
+
+        print(error_traceback)
+
+        error_text = f"{type(error).__name__}: {error}"
+
+        # Send immediately for a new error. For repeated identical errors,
+        # send another email only after the configured cooldown period.
+        is_new_error = error_text != last_error_text
+        cooldown_finished = (
+            current_time - last_email_time >= EMAIL_COOLDOWN_SECONDS
+        )
+
+        if is_new_error or cooldown_finished:
+            email_sent = send_error_email(
+                subject="PI Mismatch Tool Failure",
+                error_message=error_traceback
+            )
+
+            if email_sent:
+                last_email_time = current_time
+                last_error_text = error_text
+
+    # The loop continues whether processing or email notification fails.
+    time.sleep(CHECK_INTERVAL_SECONDS)
