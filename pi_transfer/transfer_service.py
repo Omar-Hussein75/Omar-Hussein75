@@ -1,32 +1,39 @@
 r"""
 PI Mismatch transfer service.
 
-Moves every *.json dropped into the inbox to the remote SFTP server,
-at least once, with nothing lost across crashes, reboots, network
-outages or a missing archive drive.
+Sends every *.json dropped into the inbox to the remote SFTP server,
+with nothing lost across crashes, reboots, network outages or a
+missing archive drive.
 
-The file system is the queue. Every file is always in exactly one place:
+The existing folders keep exactly the same behaviour as the old script:
 
-    inbox_dir\                 producer drops files here
-    state_dir\processing\      claimed, waiting for / retrying upload
-    state_dir\uploaded\        confirmed on the remote, waiting to be archived
-    archive_dir\               done (the old "Out" folder)
-    state_dir\failed\          quarantined (e.g. invalid JSON) - alerts fire
+    inbox_dir (C:\PI_MISMATCH_TOOL)   files stay here until they are confirmed
+                                      on the remote - "gone from inbox" still
+                                      means "sent"
+    remote_dir                        receives <name>.json, nothing else
+    archive_dir (...\Out)             receives the sent file; on a name clash
+                                      <stem>_<YYYYmmdd_HHMMSS>.json, as before
 
-Moves between inbox -> processing -> uploaded are same-drive renames,
-which are atomic on NTFS. A crash at any moment leaves the file in one
-of these folders, and the next start picks up from there.
+Everything new lives in state_dir (C:\PI_MISMATCH_TOOL_STATE):
+
+    state_dir\uploaded\    sent, but the archive folder was unavailable;
+                           moved to archive_dir as soon as it is back
+    state_dir\logs\        logs + sent-YYYY-MM.jsonl audit journal
+    state_dir\status.json  heartbeat read by healthcheck.py
+
+The inbox itself is the queue: a crash at any moment leaves unsent
+files in the inbox, and the next start sends them.
 
 Usage:
-    python transfer_service.py                 run forever (as a Windows service)
-    python transfer_service.py --once          one pass, then exit
+    python transfer_service.py                    run forever (as a Windows service)
+    python transfer_service.py --once             one pass, then exit
     python transfer_service.py --trust-host-key   save the server's SSH host key (run once)
-    python transfer_service.py --requeue-failed   move quarantined files back into the queue
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import json
 import logging
@@ -38,7 +45,7 @@ import signal
 import sys
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -70,7 +77,7 @@ class RetryState:
     attempts: int = 0
     next_try: float = 0.0
     last_error: str = ""
-    first_failure: float = field(default_factory=time.time)
+    invalid: bool = False
 
 
 def backoff_delay(attempts: int, cap: float) -> float:
@@ -88,8 +95,6 @@ class SftpUploader:
         self.client: Optional[paramiko.SSHClient] = None
         self.sftp: Optional[paramiko.SFTPClient] = None
         self.last_used = 0.0
-
-    # ---- connection management ----
 
     def close(self) -> None:
         for obj in (self.sftp, self.client):
@@ -146,7 +151,7 @@ class SftpUploader:
             username=cfg.sftp_username,
             password=password,
             key_filename=cfg.sftp_key_file,
-            timeout=cfg.connect_timeout_seconds,      # TCP connect
+            timeout=cfg.connect_timeout_seconds,
             banner_timeout=cfg.connect_timeout_seconds,
             auth_timeout=cfg.connect_timeout_seconds,
             allow_agent=False,
@@ -165,47 +170,43 @@ class SftpUploader:
         self.last_used = time.time()
         log.info("Connected.")
 
-    # ---- upload ----
-
-    def upload(self, local: Path, remote_name: str, local_sha256: str) -> str:
+    def upload(self, local: Path, local_sha256: str) -> str:
         """
-        Upload to a temporary name, verify, then atomically rename into place,
-        so the remote consumer never sees a partial *.json.
+        Default: upload straight to remote_dir/<name>, exactly like the old
+        script, then verify. If remote_staging_dir is configured (a folder
+        you create on the same remote filesystem), upload there first and
+        rename into place, so the consumer can never see a partial file.
         """
         assert self.sftp is not None
-        final_path = posixpath.join(self.cfg.remote_dir, remote_name)
-        tmp_path = final_path + ".partial"
+        cfg = self.cfg
+        final_path = posixpath.join(cfg.remote_dir, local.name)
+        upload_path = (posixpath.join(cfg.remote_staging_dir, local.name)
+                       if cfg.remote_staging_dir else final_path)
         local_size = local.stat().st_size
 
         # confirm=True makes paramiko stat the remote file and raise on size mismatch.
-        self.sftp.put(str(local), tmp_path, confirm=True)
+        self.sftp.put(str(local), upload_path, confirm=True)
 
-        remote_size = self.sftp.stat(tmp_path).st_size
+        remote_size = self.sftp.stat(upload_path).st_size
         if remote_size != local_size:
-            raise IOError(
-                f"Size mismatch after upload: local {local_size}, remote {remote_size}"
-            )
+            raise IOError(f"Size mismatch after upload: local {local_size}, remote {remote_size}")
 
-        if self.cfg.verify_remote_sha256:
-            remote_hash = self._remote_sha256(tmp_path)
+        if cfg.verify_remote_sha256:
+            remote_hash = self._remote_sha256(upload_path)
             if remote_hash != local_sha256:
-                raise IOError(
-                    f"SHA-256 mismatch after upload: local {local_sha256}, remote {remote_hash}"
-                )
+                raise IOError(f"SHA-256 mismatch: local {local_sha256}, remote {remote_hash}")
 
-        try:
-            # Atomic overwrite (OpenSSH 'posix-rename@openssh.com' extension).
-            self.sftp.posix_rename(tmp_path, final_path)
-        except IOError:
-            # Server without the extension: plain rename refuses to overwrite.
+        if upload_path != final_path:
             try:
-                self.sftp.remove(final_path)
+                self.sftp.posix_rename(upload_path, final_path)  # atomic overwrite
             except IOError:
-                pass
-            self.sftp.rename(tmp_path, final_path)
-
-        if self.sftp.stat(final_path).st_size != local_size:
-            raise IOError("Remote file size changed after rename")
+                try:
+                    self.sftp.remove(final_path)
+                except IOError:
+                    pass
+                self.sftp.rename(upload_path, final_path)
+            if self.sftp.stat(final_path).st_size != local_size:
+                raise IOError("Remote file size changed after rename")
 
         self.last_used = time.time()
         return final_path
@@ -243,24 +244,27 @@ class TransferService:
         self.archive_error = ""
         self.started = utc_now_iso()
         self.last_tick = time.time()
-        self.last_publish = 0.0
-
-    # ---- setup ----
 
     def ensure_dirs(self) -> None:
-        for d in (self.cfg.processing_dir, self.cfg.uploaded_dir,
-                  self.cfg.failed_dir, self.cfg.log_dir):
+        # Only the NEW folders are created here. The archive folder is
+        # created on demand, exactly as the old script did.
+        for d in (self.cfg.uploaded_dir, self.cfg.log_dir):
             d.mkdir(parents=True, exist_ok=True)
 
-    # ---- stage 1: claim finished files from the inbox ----
+    # ---- which inbox files are ready ----
 
-    def claim_ready_files(self) -> None:
+    def ready_files(self) -> List[Path]:
+        """
+        Inbox files the producer has finished writing, oldest first.
+        Nothing in the inbox is renamed, moved or modified here.
+        """
         cfg = self.cfg
         if not cfg.inbox_dir.exists():
             raise FileNotFoundError(f"Inbox folder does not exist: {cfg.inbox_dir}")
 
         now = time.time()
         seen_now: Dict[str, Tuple[int, float]] = {}
+        ready: List[Tuple[float, Path]] = []
 
         for path in cfg.inbox_dir.glob("*.json"):
             try:
@@ -270,36 +274,27 @@ class TransferService:
             sig = (st.st_size, st.st_mtime)
             seen_now[path.name] = sig
 
-            # Still being written? Require: unchanged since last scan AND
-            # untouched for settle_seconds. (Copies keep old mtimes, so the
-            # size/mtime-unchanged-between-scans test matters too.)
+            # Still being written? Require: unchanged since the previous scan
+            # AND untouched for settle_seconds. (Copies keep old mtimes, so the
+            # unchanged-between-scans test matters too.)
             if self.inbox_seen.get(path.name) != sig:
                 continue
             if now - st.st_mtime < cfg.settle_seconds:
                 continue
-
-            target = cfg.processing_dir / path.name
-            if target.exists():
-                # Same name still queued: keep this one in the inbox until the
-                # earlier one is sent, so the remote receives them in order.
+            if not writer_finished(path):
                 continue
-
-            try:
-                # On Windows this rename FAILS while the producer still has the
-                # file open - a free, reliable "writer is done" check.
-                os.rename(path, target)
-            except OSError as exc:
-                log.debug("Not claiming %s yet: %s", path.name, exc)
-                continue
-
-            log.info("Claimed %s (%d bytes)", path.name, st.st_size)
+            ready.append((st.st_mtime, path))
 
         self.inbox_seen = seen_now
+        # Forget retry state for files that have left the inbox.
+        for name in list(self.retries):
+            if name not in seen_now:
+                del self.retries[name]
 
-    # ---- stage 2: upload queued files ----
+        ready.sort(key=lambda item: item[0])  # oldest first: nothing starves
+        return [p for _, p in ready]
 
     def validate(self, path: Path) -> Optional[str]:
-        """Return an error message if the file is not valid JSON."""
         if not self.cfg.validate_json:
             return None
         try:
@@ -309,30 +304,14 @@ class TransferService:
         except ValueError as exc:
             return f"Invalid JSON: {exc}"
 
-    def quarantine(self, path: Path, reason: str) -> None:
-        dest = unique_path(self.cfg.failed_dir, path.name)
-        os.replace(path, dest)
-        reason_file = dest.with_name(dest.name + ".reason.txt")
-        reason_file.write_text(f"{utc_now_iso()}\n{reason}\n", encoding="utf-8")
-        self.retries.pop(path.name, None)
-        log.error("QUARANTINED %s -> %s: %s", path.name, dest, reason)
+    # ---- upload ----
 
-    def upload_pending(self) -> None:
+    def upload_ready(self) -> None:
         cfg = self.cfg
+        files = self.ready_files()
         now = time.time()
-
-        pending = sorted(
-            cfg.processing_dir.glob("*.json"),
-            key=lambda p: p.stat().st_mtime,  # oldest first: nothing starves
-        )
-        # Forget retry state for files that no longer exist.
-        names = {p.name for p in pending}
-        for name in list(self.retries):
-            if name not in names:
-                del self.retries[name]
-
-        due = [p for p in pending
-               if self.retries.get(p.name, RetryState(next_try=0)).next_try <= now]
+        due = [p for p in files
+               if self.retries.get(p.name, RetryState()).next_try <= now]
         if not due or now < self.next_connect_try:
             return
 
@@ -341,17 +320,14 @@ class TransferService:
                 return
             self.last_tick = time.time()
 
-            # -- validate (permanent problems go to quarantine, not into a retry loop)
+            # Invalid JSON is NOT sent and NOT moved: it stays in the inbox,
+            # is re-checked with backoff (the producer may rewrite it), and
+            # the healthcheck raises an alert.
             problem = self.validate(path)
             if problem:
-                age = now - path.stat().st_mtime
-                if age >= cfg.invalid_json_grace_seconds:
-                    self.quarantine(path, problem)
-                else:
-                    self._file_failed(path, problem)
+                self._file_failed(path, problem, invalid=True)
                 continue
 
-            # -- connect (if this fails, every file would fail: back off globally)
             try:
                 self.uploader.ensure_connected()
                 if self.connection_ok is not True:
@@ -359,6 +335,7 @@ class TransferService:
                 self.connection_ok = True
                 self.connect_failures = 0
             except Exception as exc:
+                # Every file would fail: back off globally instead of per file.
                 self.uploader.close()
                 self.connection_ok = False
                 self.connect_failures += 1
@@ -368,34 +345,49 @@ class TransferService:
                 log.error("SFTP connection failed (%s). Retrying in %.0fs.", exc, delay)
                 return
 
-            # -- upload
             try:
                 sha = sha256_of(path)
-                remote_path = self.uploader.upload(path, path.name, sha)
+                remote_path = self.uploader.upload(path, sha)
             except Exception as exc:
-                # Drop the connection; it may be in a bad state.
-                self.uploader.close()
+                self.uploader.close()  # connection may be in a bad state
                 self._file_failed(path, f"{type(exc).__name__}: {exc}")
                 continue
 
-            # -- confirmed on remote: record it, then move out of the queue
+            # Confirmed on the remote: record it, then take it out of the inbox.
             self._journal(path, sha, remote_path)
-            dest = unique_path(cfg.uploaded_dir, path.name)
-            os.replace(path, dest)
             self.retries.pop(path.name, None)
             self.sent_since_start += 1
             self.last_success_time = utc_now_iso()
             self.last_success_file = path.name
             log.info("SENT %s -> %s", path.name, remote_path)
+            self._move_out_of_inbox(path)
 
-    def _file_failed(self, path: Path, error: str) -> None:
+    def _move_out_of_inbox(self, path: Path) -> None:
+        """inbox -> archive (as before); if the archive is unavailable,
+        inbox -> state\\uploaded so the file is never uploaded twice."""
+        try:
+            self.cfg.archive_dir.mkdir(parents=True, exist_ok=True)
+            dest = unique_path(self.cfg.archive_dir, path.name)
+            shutil.move(str(path), str(dest))
+            return
+        except OSError as exc:
+            self._archive_failed(exc)
+        try:
+            os.replace(path, unique_path(self.cfg.uploaded_dir, path.name))
+        except OSError as exc:
+            # Extremely unlikely (same drive). Worst case: the file is sent
+            # again next cycle - a duplicate, never a loss.
+            log.error("Could not move sent file %s out of the inbox: %s", path.name, exc)
+
+    def _file_failed(self, path: Path, error: str, invalid: bool = False) -> None:
         state = self.retries.setdefault(path.name, RetryState())
         state.attempts += 1
         state.last_error = error
+        state.invalid = invalid
         delay = backoff_delay(state.attempts, self.cfg.max_retry_delay_seconds)
         state.next_try = time.time() + delay
         self._record_error(f"{path.name}: {error}")
-        log.warning("Upload of %s failed (attempt %d): %s. Retrying in %.0fs.",
+        log.warning("%s failed (attempt %d): %s. Retrying in %.0fs.",
                     path.name, state.attempts, error, delay)
 
     def _record_error(self, text: str) -> None:
@@ -419,9 +411,9 @@ class TransferService:
         except OSError as exc:
             log.warning("Could not write journal: %s", exc)
 
-    # ---- stage 3: archive (decoupled: an unavailable E: drive never blocks uploads) ----
+    # ---- archive catch-up (an unavailable archive never blocks uploads) ----
 
-    def archive_uploaded(self) -> None:
+    def archive_backlog(self) -> None:
         files = list(self.cfg.uploaded_dir.glob("*.json"))
         if not files:
             self.archive_error = ""
@@ -429,16 +421,16 @@ class TransferService:
         try:
             self.cfg.archive_dir.mkdir(parents=True, exist_ok=True)
             for path in files:
-                dest = unique_path(self.cfg.archive_dir, path.name)
-                shutil.move(str(path), str(dest))
-            if self.archive_error:
-                log.info("Archive folder reachable again.")
+                shutil.move(str(path), str(unique_path(self.cfg.archive_dir, path.name)))
+            log.info("Archive folder reachable again; %d file(s) archived.", len(files))
             self.archive_error = ""
         except OSError as exc:
-            if not self.archive_error:
-                log.warning("Archiving to %s failed (will retry): %s",
-                            self.cfg.archive_dir, exc)
-            self.archive_error = str(exc)
+            self._archive_failed(exc)
+
+    def _archive_failed(self, exc: Exception) -> None:
+        if not self.archive_error:
+            log.warning("Archiving to %s failed (will retry): %s", self.cfg.archive_dir, exc)
+        self.archive_error = str(exc)
 
     # ---- status / heartbeat ----
 
@@ -448,14 +440,15 @@ class TransferService:
 
         def ages(folder: Path) -> List[float]:
             out = []
-            for p in folder.glob("*.json"):
-                try:
-                    out.append(now - p.stat().st_mtime)
-                except FileNotFoundError:
-                    pass
+            if folder.exists():
+                for p in folder.glob("*.json"):
+                    try:
+                        out.append(now - p.stat().st_mtime)
+                    except FileNotFoundError:
+                        pass
             return out
 
-        processing_ages = ages(cfg.processing_dir)
+        inbox_ages = ages(cfg.inbox_dir)
         status = {
             "service": "PI Mismatch Transfer",
             "host": hostname(),
@@ -466,12 +459,11 @@ class TransferService:
             "last_success_utc": self.last_success_time,
             "last_success_file": self.last_success_file,
             "sent_since_start": self.sent_since_start,
-            "queue_count": len(processing_ages),
-            "queue_oldest_age_seconds": round(max(processing_ages, default=0)),
-            "inbox_count": len(ages(cfg.inbox_dir)) if cfg.inbox_dir.exists() else None,
+            "inbox_count": len(inbox_ages),
+            "inbox_oldest_age_seconds": round(max(inbox_ages, default=0)),
             "awaiting_archive_count": len(ages(cfg.uploaded_dir)),
             "archive_error": self.archive_error or None,
-            "failed_count": len(list(cfg.failed_dir.glob("*.json"))),
+            "invalid_files": sorted(n for n, s in self.retries.items() if s.invalid),
             "last_error": self.last_error or None,
             "last_error_utc": self.last_error_time,
             "retrying": [
@@ -481,19 +473,11 @@ class TransferService:
         }
         write_json_atomic(cfg.status_file, status)
 
-        # Optional copy to a SharePoint-synced folder so the team can see it.
-        if cfg.publish_dir and now - self.last_publish >= 60:
-            self.last_publish = now
-            try:
-                write_json_atomic(cfg.publish_dir / "transfer_status.json", status)
-            except OSError:
-                pass
-
     # ---- main loop ----
 
     def run_cycle(self) -> None:
         self.last_tick = time.time()
-        for stage in (self.claim_ready_files, self.upload_pending, self.archive_uploaded):
+        for stage in (self.upload_ready, self.archive_backlog):
             try:
                 stage()
             except Exception as exc:
@@ -512,6 +496,23 @@ class TransferService:
             STOP.wait(self.cfg.poll_seconds)
         self.uploader.close()
         log.info("Stopped cleanly.")
+
+
+def writer_finished(path: Path) -> bool:
+    """
+    True if no other process holds the file open for writing. Opening for
+    read+write (without writing anything) fails on Windows while the
+    producer still has it open. The file content and timestamps are not
+    changed.
+    """
+    if not os.access(path, os.W_OK):
+        return True  # read-only file: nobody can be writing it
+    try:
+        with open(path, "r+b"):
+            pass
+        return True
+    except OSError:
+        return False
 
 
 def sha256_of(path: Path) -> str:
@@ -542,10 +543,6 @@ def start_hang_watchdog(service: TransferService) -> None:
     threading.Thread(target=watch, name="hang-watchdog", daemon=True).start()
 
 
-# ==========================================
-# One-off commands
-# ==========================================
-
 def trust_host_key(cfg: Config) -> None:
     """Fetch the server's host key, show its fingerprint and save it."""
     transport = paramiko.Transport((cfg.sftp_host, cfg.sftp_port))
@@ -556,9 +553,7 @@ def trust_host_key(cfg: Config) -> None:
     finally:
         transport.close()
 
-    fingerprint = hashlib.sha256(key.asbytes()).digest()
-    import base64
-    fp = base64.b64encode(fingerprint).decode().rstrip("=")
+    fp = base64.b64encode(hashlib.sha256(key.asbytes()).digest()).decode().rstrip("=")
     print(f"Server {cfg.sftp_host}:{cfg.sftp_port} presents {key.get_name()} key")
     print(f"  SHA256:{fp}")
     print("Confirm this fingerprint with the server admin (ssh-keygen -lf /etc/ssh/ssh_host_*_key.pub).")
@@ -572,23 +567,6 @@ def trust_host_key(cfg: Config) -> None:
     hosts.save(str(cfg.known_hosts_file))
     print(f"Saved to {cfg.known_hosts_file}")
 
-
-def requeue_failed(cfg: Config) -> None:
-    count = 0
-    for path in cfg.failed_dir.glob("*.json"):
-        dest = unique_path(cfg.processing_dir, path.name)
-        os.replace(path, dest)
-        reason = path.with_name(path.name + ".reason.txt")
-        if reason.exists():
-            reason.unlink()
-        count += 1
-        print(f"Requeued {path.name}")
-    print(f"{count} file(s) moved back to the queue.")
-
-
-# ==========================================
-# Entry point
-# ==========================================
 
 def install_signal_handlers() -> None:
     def handler(signum, frame):  # noqa: ARG001
@@ -606,7 +584,6 @@ def main() -> int:
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--once", action="store_true", help="run one pass and exit")
     parser.add_argument("--trust-host-key", action="store_true")
-    parser.add_argument("--requeue-failed", action="store_true")
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
 
@@ -625,19 +602,14 @@ def main() -> int:
 
     service = TransferService(cfg)
     service.ensure_dirs()
-
-    if args.requeue_failed:
-        requeue_failed(cfg)
-        return 0
-
     install_signal_handlers()
     log.info("PI Mismatch transfer service starting. inbox=%s remote=%s:%s",
              cfg.inbox_dir, cfg.sftp_host, cfg.remote_dir)
 
     if args.once:
-        # Files only become claimable once seen unchanged across two scans.
-        service.claim_ready_files()
-        time.sleep(1)
+        # Files only count as ready once seen unchanged across two scans.
+        service.ready_files()
+        time.sleep(max(1.0, cfg.settle_seconds))
         service.run_cycle()
         service.uploader.close()
         return 0

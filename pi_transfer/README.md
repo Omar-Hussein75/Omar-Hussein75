@@ -15,32 +15,46 @@
 
 ## New architecture
 
+**The existing folders behave exactly as before.** Whatever else is linked to them sees no difference:
+
+| Existing location | Behaviour (unchanged from the old script) |
+|---|---|
+| `C:\PI_MISMATCH_TOOL` | Producers drop `*.json` here. Files are never renamed or modified, and they leave **only after they are confirmed on the remote**, so "gone from the inbox" still means "sent". |
+| Remote `/project/PI_MISMATCH_TOOL/requests` | Receives `<name>.json`, nothing else. No temporary or extra files. |
+| `E:\SharePoint_PI_Mismatch_Tool\Out` | Receives each sent file. On a name clash: `<stem>_<YYYYmmdd_HHMMSS>.json`, as before. |
+| `E:\SharePoint_PI_Mismatch_Tool` | Not touched. |
+
+Everything new lives only in **new** folders: `C:\PI_Transfer` (the code) and `C:\PI_MISMATCH_TOOL_STATE` (logs, status, archive backlog).
+
 ```
-                   ┌──────────── Windows Service (WinSW) ─────────────┐
- producer ──► inbox ─claim─► processing ─upload─► uploaded ─archive─► archive (E:\…\Out)
-  (*.json)   C:\PI_MISMATCH_TOOL │                    │
-                                 └─invalid JSON─► failed (quarantine)
-                   │ status.json heartbeat, logs, sent-YYYY-MM.jsonl audit journal   │
-                   └──────────────────────────────────────────────────────────────────┘
-                                 ▲ reads folders + heartbeat directly
-   Task Scheduler, every 5 min:  healthcheck.py ──► Event Log / Teams webhook / HEALTH.txt
-                                                └─► restarts the service if the heartbeat is stale
+                 ┌─────────────── Windows Service (WinSW) ────────────────┐
+ producer ──► C:\PI_MISMATCH_TOOL ──upload + verify──► remote requests/
+                 │      (inbox = the queue)    │
+                 │                             └─ then move ──► E:\…\Out
+                 │                                  (if Out is unavailable: wait in
+                 │                                   STATE\uploaded, moved later)
+                 │  STATE\status.json heartbeat · STATE\logs\ · sent-YYYY-MM.jsonl
+                 └────────────────────────────────────────────────────────┘
+                              ▲ reads the folders and the heartbeat directly
+ Task Scheduler, every 5 min: healthcheck.py ──► Event Log / Teams webhook
+                                              └─► restarts the service if it is hung or down
 ```
 
 **Design principles**
 
-* **The file system is the queue.** Each file is always in exactly one folder. Moves between `inbox`, `processing` and `uploaded` are same-drive renames, which are atomic. A crash, power loss or reboot at any point leaves every file in a folder that the next run picks up. There is no in-memory state to lose.
-* **A file is only claimed when its writer is finished**: its size and mtime are unchanged across two scans, it hasn't been touched for `settle_seconds`, and the rename succeeds (Windows refuses the rename while the producer has the file open).
-* **Remote writes are atomic**: the file is uploaded as `name.json.partial`, its size is checked (optionally its SHA-256 too), and it is then renamed to `name.json`. The remote side never sees a partial file.
+* **The inbox is the queue.** A file stays in `C:\PI_MISMATCH_TOOL` until the remote confirms it. A crash, power loss or reboot at any point leaves unsent files where they were, and the next run sends them. There is no in-memory state to lose.
+* **A file is only sent when its writer is finished**: its size and mtime are unchanged across two scans, it hasn't been touched for `settle_seconds`, and no other process has it open for writing. The check doesn't modify the file.
+* **Every upload is verified** by comparing the remote size with the local size (SHA-256 optional), before the file leaves the inbox.
 * **Retries never stop.** Each file has its own exponential backoff (5 s → 10 s → … → 5 min cap). A connection failure triggers a global backoff instead of hammering the server. Files are sent oldest first, and one bad file never blocks the others.
-* **Permanent errors are quarantined, not retried forever**: a file that is still invalid JSON after a grace period goes to `failed\` with a `.reason.txt`, and an alert is raised.
-* **Archiving is decoupled.** An unavailable archive drive never stops or repeats uploads; files wait in `uploaded\` and are moved when the drive comes back.
+* **Invalid JSON is not sent and not moved.** It stays in the inbox untouched, is re-checked automatically, and raises an alert. Set `validate_json = false` to send everything, like the old script.
+* **An unavailable `Out` folder never blocks or repeats uploads.** The file waits in `STATE\uploaded` and is moved to `Out` when the folder is back.
 * **Self-healing in three layers:**
-  1. Socket, connect and I/O timeouts plus SSH keepalive, so calls fail instead of hanging.
+  1. Connect and I/O timeouts plus SSH keepalive, so calls fail instead of hanging.
   2. An in-process hang watchdog: if the main loop makes no progress for 15 min, the process exits.
-  3. The Windows Service Manager (WinSW) restarts it on any exit, starts it at boot, and needs no logged-on user. On top of that, the independent healthcheck restarts the service if the heartbeat goes stale.
-* **Monitoring without SMTP:** the Windows Event Log (works with any monitoring agent: SCOM, Zabbix, Splunk, etc.), a Teams Workflows webhook (or any JSON webhook), and `HEALTH.txt` / `health.json` in the SharePoint folder so the team can see the status themselves. Alerts are de-duplicated (on start, every hour while the problem lasts, and a "RESOLVED" message when it clears).
-* **Audit trail:** `logs\sent-YYYY-MM.jsonl` records every confirmed transfer (time, size, SHA-256, remote path). It answers "was my file sent?" in seconds.
+  3. The Windows Service Manager restarts it on any exit, starts it at boot, and needs no logged-on user. On top of that, the independent healthcheck restarts the service if the heartbeat goes stale.
+* **Monitoring without SMTP:** the Windows Event Log (works with any monitoring agent: SCOM, Zabbix, Splunk, etc.) and a Teams Workflows webhook (or any JSON webhook). Optionally, `HEALTH.txt` can be written to a **new** folder of your choice. Alerts are de-duplicated (on start, every hour while the problem lasts, and a "RESOLVED" message when it clears).
+* **Audit trail:** `STATE\logs\sent-YYYY-MM.jsonl` records every confirmed transfer (time, size, SHA-256, remote path).
+* **Optional atomic remote delivery:** if the server admin creates a **new** folder such as `/project/PI_MISMATCH_TOOL/staging`, set `remote_staging_dir`. Files are then uploaded there and renamed into `requests/`, so the remote consumer can never read a half-uploaded file. This is off by default, so `requests/` behaves exactly as today.
 
 **Why a Windows service instead of a scheduled task?** Task Scheduler is a scheduler, not a supervisor: it doesn't notice a hung process, and its defaults kill long-running tasks after 3 days. A service gets boot start, restart on failure and no dependency on a logged-on user, which is what keeps it running 24/7. Task Scheduler is still the right tool for the *watchdog*, because that job is short and periodic.
 
@@ -82,12 +96,9 @@
 
 | Task | How |
 |---|---|
-| Is it healthy? | `HEALTH.txt` in the SharePoint folder, or `C:\PI_MISMATCH_TOOL_STATE\status.json` |
+| Is it healthy? | `C:\PI_MISMATCH_TOOL_STATE\status.json` (or `HEALTH.txt`, if `publish_dir` is set) |
 | Was file X sent? | Search `C:\PI_MISMATCH_TOOL_STATE\logs\sent-*.jsonl` |
 | Logs | `C:\PI_MISMATCH_TOOL_STATE\logs\transfer.log` (rotated daily, kept 60 days) |
-| A file was quarantined | Read `failed\<file>.reason.txt`, fix the file, then run `python transfer_service.py --requeue-failed` |
+| An "invalid JSON" alert | Fix or replace the file in `C:\PI_MISMATCH_TOOL`; it is picked up automatically |
 | Stop / start | `PITransferService.exe stop` / `start` (or `services.msc`) |
-
-## Remote-side note
-
-The consumer on the SFTP server should ignore `*.partial` files. (It already only sees complete `*.json` files, because the rename is atomic.)
+| Roll back | Stop the service and re-enable the old task. Unsent files are still in the inbox. Move any files in `STATE\uploaded` to `Out` by hand. |

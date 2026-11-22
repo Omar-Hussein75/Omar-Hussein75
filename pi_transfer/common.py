@@ -33,9 +33,9 @@ CONFIG_FILE = Path(os.getenv("PI_TRANSFER_CONFIG", BASE_DIR / "config.ini"))
 class Config:
     # Folders
     inbox_dir: Path          # where producers drop *.json
-    state_dir: Path          # queue + logs + status (MUST be on the same drive as inbox_dir)
+    state_dir: Path          # NEW folder: logs, status, archive backlog (same drive as inbox_dir)
     archive_dir: Path        # long-term archive of sent files
-    publish_dir: Optional[Path]  # optional: status/health copied here (e.g. SharePoint-synced folder)
+    publish_dir: Optional[Path]  # optional, off by default: health files copied to a NEW folder of your choice
 
     # Timing
     poll_seconds: float
@@ -49,19 +49,18 @@ class Config:
     sftp_username: str
     sftp_key_file: Optional[str]
     remote_dir: str
+    remote_staging_dir: Optional[str]
     connect_timeout_seconds: float
     io_timeout_seconds: float
     verify_remote_sha256: bool
 
     # Validation
     validate_json: bool
-    invalid_json_grace_seconds: float
 
     # Healthcheck / alerting
     service_name: str
     heartbeat_stale_seconds: float
     backlog_alert_seconds: float
-    inbox_stuck_alert_seconds: float
     archive_backlog_alert_seconds: float
     alert_repeat_seconds: float
     restart_service_if_stale: bool
@@ -71,16 +70,8 @@ class Config:
 
     # Derived paths
     @property
-    def processing_dir(self) -> Path:
-        return self.state_dir / "processing"
-
-    @property
     def uploaded_dir(self) -> Path:
         return self.state_dir / "uploaded"
-
-    @property
-    def failed_dir(self) -> Path:
-        return self.state_dir / "failed"
 
     @property
     def log_dir(self) -> Path:
@@ -136,17 +127,16 @@ def load_config(path: Path = CONFIG_FILE) -> Config:
         sftp_username=get("sftp", "username"),
         sftp_key_file=key_file or None,
         remote_dir=get("sftp", "remote_dir").rstrip("/"),
+        remote_staging_dir=get("sftp", "remote_staging_dir", "").rstrip("/") or None,
         connect_timeout_seconds=getf("sftp", "connect_timeout_seconds", "20"),
         io_timeout_seconds=getf("sftp", "io_timeout_seconds", "120"),
         verify_remote_sha256=getb("sftp", "verify_remote_sha256", "false"),
 
         validate_json=getb("validation", "validate_json", "true"),
-        invalid_json_grace_seconds=getf("validation", "invalid_json_grace_seconds", "120"),
 
         service_name=get("health", "service_name", "PITransferService"),
         heartbeat_stale_seconds=getf("health", "heartbeat_stale_seconds", "300"),
         backlog_alert_seconds=getf("health", "backlog_alert_seconds", "900"),
-        inbox_stuck_alert_seconds=getf("health", "inbox_stuck_alert_seconds", "600"),
         archive_backlog_alert_seconds=getf("health", "archive_backlog_alert_seconds", "3600"),
         alert_repeat_seconds=getf("health", "alert_repeat_seconds", "3600"),
         restart_service_if_stale=getb("health", "restart_service_if_stale", "true"),
@@ -262,12 +252,18 @@ def read_json(path: Path, default: Any = None) -> Any:
 
 
 def unique_path(directory: Path, name: str) -> Path:
-    """Return directory/name, or a timestamped variant if it already exists."""
+    """
+    directory/name, or - same pattern as the old script - <stem>_<YYYYmmdd_HHMMSS><suffix>
+    if that name is taken (a counter is added only if that is taken too).
+    """
     candidate = directory / name
     if not candidate.exists():
         return candidate
     stem, suffix = Path(name).stem, Path(name).suffix
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    candidate = directory / f"{stem}_{stamp}{suffix}"
+    if not candidate.exists():
+        return candidate
     counter = 1
     while True:
         candidate = directory / f"{stem}_{stamp}_{counter}{suffix}"

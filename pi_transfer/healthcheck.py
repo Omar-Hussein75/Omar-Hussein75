@@ -10,8 +10,8 @@ channels that do not need SMTP:
     -> picked up by SCOM / Zabbix / Splunk / any Windows monitoring agent
   * Microsoft Teams (Workflows webhook) or any generic JSON webhook, if
     outbound HTTPS is allowed
-  * health.json / HEALTH.txt in publish_dir (e.g. the SharePoint-synced
-    folder), so anyone can see the current state
+  * health.json / HEALTH.txt in publish_dir (optional, off by default; use a
+    NEW folder - never one of the existing tool folders)
 
 Alerts are de-duplicated: sent when a problem starts, repeated every
 alert_repeat_seconds while it lasts, and a RESOLVED message when it clears.
@@ -54,7 +54,9 @@ def oldest_age(folder: Path, pattern: str = "*.json") -> Tuple[int, float]:
     if folder.exists():
         for p in folder.glob(pattern):
             try:
-                ages.append(now - p.stat().st_mtime)
+                st = p.stat()
+                # ctime = creation time on Windows (a copied-in file keeps its old mtime)
+                ages.append(now - max(st.st_mtime, st.st_ctime))
             except FileNotFoundError:
                 pass
     return len(ages), max(ages, default=0.0)
@@ -75,24 +77,20 @@ def run_checks(cfg: Config) -> Tuple[List[Problem], Dict]:
         problems.append(("sftp_unreachable", "ERROR",
                          f"Cannot connect to SFTP server {cfg.sftp_host}: {status.get('last_error')}"))
 
-    n, age = oldest_age(cfg.processing_dir)
-    if n and age > cfg.backlog_alert_seconds:
-        problems.append(("queue_backlog", "ERROR",
-                         f"{n} file(s) waiting to be sent; oldest is {age / 60:.0f} min old. "
-                         f"Last error: {status.get('last_error')}"))
-
-    # Checked straight from the folder: catches the case where the service is
+    # Checked straight from the folder, so it also works when the service is
     # dead, or the producer keeps files locked.
     n, age = oldest_age(cfg.inbox_dir)
-    if n and age > cfg.inbox_stuck_alert_seconds:
-        problems.append(("inbox_stuck", "ERROR",
-                         f"{n} file(s) in {cfg.inbox_dir} not picked up; oldest is {age / 60:.0f} min old."))
+    if n and age > cfg.backlog_alert_seconds:
+        problems.append(("queue_backlog", "ERROR",
+                         f"{n} file(s) in {cfg.inbox_dir} not sent yet; oldest arrived "
+                         f"{age / 60:.0f} min ago. Last error: {status.get('last_error')}"))
 
-    n, _ = oldest_age(cfg.failed_dir)
-    if n:
-        problems.append(("quarantined", "ERROR",
-                         f"{n} file(s) quarantined in {cfg.failed_dir} (see *.reason.txt). "
-                         "Fix the file, then run: python transfer_service.py --requeue-failed"))
+    invalid = status.get("invalid_files") or []
+    if invalid:
+        problems.append(("invalid_json", "ERROR",
+                         f"{len(invalid)} file(s) in {cfg.inbox_dir} are not valid JSON and are "
+                         f"NOT being sent: {', '.join(invalid[:10])}. Fix or replace them; "
+                         "they are re-checked automatically."))
 
     n, age = oldest_age(cfg.uploaded_dir)
     if n and age > cfg.archive_backlog_alert_seconds:
@@ -236,7 +234,7 @@ def main() -> int:
         lines += [f"[{s}] {m}" for _, s, m in problems]
         lines += ["", f"Last successful transfer: {status.get('last_success_utc')} "
                       f"({status.get('last_success_file')})",
-                  f"Files waiting: {status.get('queue_count')}"]
+                  f"Files waiting: {status.get('inbox_count')}"]
         try:
             write_json_atomic(cfg.publish_dir / "health.json", summary)
             (cfg.publish_dir / "HEALTH.txt").write_text("\n".join(lines), encoding="utf-8")
@@ -245,7 +243,7 @@ def main() -> int:
 
     if not problems:
         log.info("Healthy. queue=%s last_success=%s",
-                 status.get("queue_count"), status.get("last_success_utc"))
+                 status.get("inbox_count"), status.get("last_success_utc"))
     return 1 if problems else 0
 
 
