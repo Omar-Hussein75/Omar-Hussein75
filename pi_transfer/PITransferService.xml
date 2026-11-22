@@ -1,0 +1,45 @@
+<!--
+  WinSW (Windows Service Wrapper) definition: https://github.com/winsw/winsw
+  Rename WinSW-x64.exe to PITransferService.exe and place it next to this file.
+  Install:  PITransferService.exe install
+  Start:    PITransferService.exe start
+-->
+<service>
+  <id>PITransferService</id>
+  <name>PI Mismatch Transfer Service</name>
+  <description>Uploads PI Mismatch JSON request files to the SFTP server.</description>
+
+  <executable>C:\Program Files\Python312\python.exe</executable>
+  <arguments>-u "C:\PI_Transfer\transfer_service.py"</arguments>
+  <workingdirectory>C:\PI_Transfer</workingdirectory>
+
+  <!-- Starts at boot, no user needs to be logged on. -->
+  <startmode>Automatic</startmode>
+  <delayedAutoStart>true</delayedAutoStart>
+
+  <!-- Restart on any crash/exit, forever. -->
+  <onfailure action="restart" delay="10 sec"/>
+  <onfailure action="restart" delay="30 sec"/>
+  <onfailure action="restart" delay="60 sec"/>
+  <resetfailure>1 hour</resetfailure>
+
+  <!-- Ctrl+C first so the script stops cleanly, then kill. -->
+  <stoptimeout>30 sec</stoptimeout>
+
+  <!-- Captures anything printed outside the app's own log (e.g. import errors). -->
+  <logpath>C:\PI_MISMATCH_TOOL_STATE\logs</logpath>
+  <log mode="roll-by-size">
+    <sizeThreshold>10240</sizeThreshold>
+    <keepFiles>5</keepFiles>
+  </log>
+
+  <!--
+    Run as a dedicated service account that can read/write C:\PI_MISMATCH_TOOL*,
+    write the archive share, and read the SSH key. Example:
+  <serviceaccount>
+    <username>DOMAIN\svc_pi_transfer</username>
+    <password>set-at-install-time</password>
+    <allowservicelogon>true</allowservicelogon>
+  </serviceaccount>
+  -->
+</service>
