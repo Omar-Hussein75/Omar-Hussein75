@@ -1,0 +1,11 @@
+[Unit]
+Description=PI Mismatch transfer watchdog (checks the Windows sender's heartbeat)
+After=network-online.target
+
+[Service]
+Type=oneshot
+# Same account that owns the transfer folders.
+User=raidprd
+EnvironmentFile=/etc/pi-transfer/check.conf
+StateDirectory=pi-transfer
+ExecStart=/usr/local/bin/pi-transfer-check

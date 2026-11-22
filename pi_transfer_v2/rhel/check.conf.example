@@ -1,0 +1,24 @@
+# /etc/pi-transfer/check.conf  - read by pi-transfer-check.service
+
+HEARTBEAT_DIR=/project/PI_MISMATCH_TOOL_TRANSFER/heartbeat
+STAGING_DIR=/project/PI_MISMATCH_TOOL_TRANSFER/incoming
+
+# Windows computer name(s) expected to send heartbeats (%COMPUTERNAME%).
+# Set this, so a sender that never reports at all is also caught.
+EXPECTED_SENDERS=
+
+HEARTBEAT_STALE_MIN=10
+BACKLOG_ALERT_MIN=15
+ALERT_REPEAT_MIN=60
+PART_CLEANUP_MIN=120
+
+# Email from THIS server (leave SMTP_HOST empty to disable).
+SMTP_HOST=
+SMTP_PORT=25
+MAIL_FROM=
+MAIL_TO=
+
+# Teams: channel -> Workflows -> "Post to a channel when a webhook request is received".
+WEBHOOK_URL=
+# teams | generic  (generic = {"text": ...} for Slack/Mattermost/Google Chat)
+WEBHOOK_KIND=teams

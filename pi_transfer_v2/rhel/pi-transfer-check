@@ -1,0 +1,226 @@
+#!/usr/bin/python3
+"""
+PI Mismatch transfer watchdog - RHEL side.
+
+Runs every 5 minutes from a systemd timer. All monitoring and alerting
+lives here, on the server we own, so the Windows jump machine only has
+to send files and a heartbeat.
+
+Detects:
+  * sender silent      - no heartbeat for HEARTBEAT_STALE_MIN
+                         (jump machine down/rebooted, user logged off,
+                         task disabled, network or SSH key broken)
+  * backlog            - the sender reports a file waiting in its inbox
+                         longer than BACKLOG_ALERT_MIN
+                         (persistent send errors show up here; one-off
+                         errors are retried silently and only logged)
+  * archive problem    - the sender cannot reach its Out folder
+Also removes *.part leftovers of interrupted uploads (the source file is
+still in the Windows inbox, so it is simply sent again).
+
+Alerts: email through SMTP_HOST (from this server), a Teams/generic
+webhook, and the systemd journal. Each problem alerts once, repeats every
+ALERT_REPEAT_MIN while it lasts, and sends RESOLVED when it clears.
+
+Configuration: environment variables, normally from
+/etc/pi-transfer/check.conf (see check.conf.example).
+Compatible with RHEL 8 (python 3.6) and later; standard library only.
+"""
+
+import json
+import os
+import smtplib
+import socket
+import sys
+import time
+import urllib.request
+from email.message import EmailMessage
+
+
+def env(name, default=""):
+    return os.environ.get(name, default).strip()
+
+
+HEARTBEAT_DIR = env("HEARTBEAT_DIR", "/project/PI_MISMATCH_TOOL_TRANSFER/heartbeat")
+STAGING_DIR = env("STAGING_DIR", "/project/PI_MISMATCH_TOOL_TRANSFER/incoming")
+EXPECTED_SENDERS = [s for s in env("EXPECTED_SENDERS").replace(",", " ").split() if s]
+HEARTBEAT_STALE_MIN = float(env("HEARTBEAT_STALE_MIN", "10"))
+BACKLOG_ALERT_MIN = float(env("BACKLOG_ALERT_MIN", "15"))
+PART_CLEANUP_MIN = float(env("PART_CLEANUP_MIN", "120"))
+ALERT_REPEAT_MIN = float(env("ALERT_REPEAT_MIN", "60"))
+STATE_FILE = env("STATE_FILE", os.path.join(
+    os.environ.get("STATE_DIRECTORY", "/var/lib/pi-transfer"), "check-state.json"))
+
+SMTP_HOST = env("SMTP_HOST")
+SMTP_PORT = int(env("SMTP_PORT", "25"))
+MAIL_FROM = env("MAIL_FROM", "pi-transfer@" + socket.getfqdn())
+MAIL_TO = [a for a in env("MAIL_TO").replace(",", " ").split() if a]
+WEBHOOK_URL = env("WEBHOOK_URL")
+WEBHOOK_KIND = env("WEBHOOK_KIND", "teams").lower()
+
+
+def log(msg):
+    print(msg, flush=True)  # goes to the systemd journal
+
+
+# ======================================================================
+# Checks
+# ======================================================================
+
+def run_checks():
+    """Return a list of (key, severity, message)."""
+    problems = []
+    now = time.time()
+
+    heartbeats = {}
+    if os.path.isdir(HEARTBEAT_DIR):
+        for name in os.listdir(HEARTBEAT_DIR):
+            if name.endswith(".json"):
+                heartbeats[name[:-5]] = os.path.join(HEARTBEAT_DIR, name)
+    else:
+        problems.append(("config", "ERROR", "Heartbeat folder missing: " + HEARTBEAT_DIR))
+
+    senders = EXPECTED_SENDERS or sorted(heartbeats)
+    if not senders:
+        problems.append(("no_sender", "ERROR",
+                         "No heartbeat has ever been received from the Windows jump machine."))
+
+    for sender in senders:
+        path = heartbeats.get(sender)
+        if not path:
+            problems.append(("silent:" + sender, "ERROR",
+                             "No heartbeat from %s at all. Files are NOT being transferred." % sender))
+            continue
+
+        # File mtime = when the server received it: immune to Windows clock skew.
+        age_min = (now - os.path.getmtime(path)) / 60
+        if age_min > HEARTBEAT_STALE_MIN:
+            problems.append(("silent:" + sender, "ERROR",
+                             "No heartbeat from %s for %.0f min. Files are NOT being transferred. "
+                             "Check that the machine is up, the user is logged on and the "
+                             "'PI Transfer' scheduled task is enabled." % (sender, age_min)))
+            continue  # the rest of its heartbeat is stale too
+
+        try:
+            with open(path, encoding="utf-8-sig") as fh:
+                hb = json.load(fh)
+        except (OSError, ValueError) as exc:
+            problems.append(("badhb:" + sender, "WARNING", "Unreadable heartbeat from %s: %s" % (sender, exc)))
+            continue
+
+        backlog_min = (hb.get("inbox_oldest_age_seconds") or 0) / 60
+        if hb.get("inbox_count") and backlog_min > BACKLOG_ALERT_MIN:
+            problems.append(("backlog:" + sender, "ERROR",
+                             "%s has %s file(s) waiting to be sent; oldest %.0f min. Last error: %s"
+                             % (sender, hb.get("inbox_count"), backlog_min, hb.get("last_error"))))
+
+        if hb.get("not_archived_count"):
+            problems.append(("archive:" + sender, "WARNING",
+                             "%s sent %s file(s) but cannot move them to its Out folder: %s"
+                             % (sender, hb.get("not_archived_count"), hb.get("archive_error"))))
+
+    return problems
+
+
+def clean_stale_parts():
+    if not os.path.isdir(STAGING_DIR):
+        return
+    limit = time.time() - PART_CLEANUP_MIN * 60
+    for name in os.listdir(STAGING_DIR):
+        path = os.path.join(STAGING_DIR, name)
+        if name.endswith(".part") and os.path.getmtime(path) < limit:
+            try:
+                os.remove(path)
+                log("Removed interrupted upload " + path)
+            except OSError as exc:
+                log("Could not remove %s: %s" % (path, exc))
+
+
+# ======================================================================
+# Alerts
+# ======================================================================
+
+def send_email(subject, body):
+    if not (SMTP_HOST and MAIL_TO):
+        return
+    msg = EmailMessage()
+    msg["From"], msg["To"], msg["Subject"] = MAIL_FROM, ", ".join(MAIL_TO), subject
+    msg.set_content(body)
+    try:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as smtp:
+            smtp.send_message(msg)
+    except Exception as exc:
+        log("Email alert failed: %s" % exc)
+
+
+def send_webhook(subject, body):
+    if not WEBHOOK_URL:
+        return
+    if WEBHOOK_KIND == "teams":  # Teams "Workflows" webhook -> Adaptive Card
+        payload = {"type": "message", "attachments": [{
+            "contentType": "application/vnd.microsoft.card.adaptive",
+            "content": {"$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+                        "type": "AdaptiveCard", "version": "1.4",
+                        "body": [{"type": "TextBlock", "text": subject, "weight": "Bolder", "wrap": True},
+                                 {"type": "TextBlock", "text": body, "wrap": True}]}}]}
+    else:
+        payload = {"text": "*%s*\n%s" % (subject, body)}
+    req = urllib.request.Request(WEBHOOK_URL, data=json.dumps(payload).encode(),
+                                 headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        urllib.request.urlopen(req, timeout=20).read()
+    except Exception as exc:
+        log("Webhook alert failed: %s" % exc)
+
+
+def alert(severity, message):
+    subject = "[PI Transfer] %s: %s" % (severity, message[:80])
+    body = "%s\n\nServer: %s\nTime: %s" % (message, socket.getfqdn(), time.strftime("%Y-%m-%d %H:%M:%S %Z"))
+    log("ALERT %s: %s" % (severity, message))
+    send_email(subject, body)
+    send_webhook(subject, body)
+
+
+# ======================================================================
+# Main
+# ======================================================================
+
+def main():
+    clean_stale_parts()
+    problems = run_checks()
+
+    try:
+        with open(STATE_FILE) as fh:
+            state = json.load(fh)
+    except (OSError, ValueError):
+        state = {}
+
+    now = time.time()
+    active = set()
+    for key, severity, message in problems:
+        active.add(key)
+        entry = state.get(key)
+        if entry is None:
+            state[key] = {"since": now, "last_alert": now}
+            alert(severity, message)
+        elif now - entry["last_alert"] >= ALERT_REPEAT_MIN * 60:
+            entry["last_alert"] = now
+            alert(severity, "STILL FAILING (%.0f min): %s" % ((now - entry["since"]) / 60, message))
+
+    for key in [k for k in state if k not in active]:
+        alert("RESOLVED", "'%s' is OK again after %.0f min." % (key, (now - state[key]["since"]) / 60))
+        del state[key]
+
+    os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+    tmp = STATE_FILE + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(state, fh)
+    os.replace(tmp, STATE_FILE)
+
+    if not problems:
+        log("Healthy.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
